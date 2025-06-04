@@ -1,4 +1,4 @@
-.PHONY: all format lint test tests test_watch integration_tests docker_tests help extended_tests
+.PHONY: all format lint test tests test_watch integration_tests docker_tests help extended_tests dev venv setup
 
 # Default target executed when no arguments are given to make.
 all: help
@@ -18,6 +18,20 @@ test_profile:
 extended_tests:
 	uv run --with-editable . pytest --only-extended $(TEST_FILE)
 
+venv:
+	@if [ ! -d "venv" ]; then \
+		python3 -m venv venv; \
+		echo "Virtual environment created."; \
+	else \
+		echo "Virtual environment already exists."; \
+	fi
+
+setup: venv
+	@echo "Installing dependencies..."
+	@./venv/bin/pip install -e ".[dev]" uvicorn
+
+dev: venv
+	./venv/bin/python -m uvicorn src.main:app --reload --host 0.0.0.0 --port 8000
 
 ######################
 # LINTING AND FORMATTING
@@ -61,4 +75,7 @@ help:
 	@echo 'tests                        - run unit tests'
 	@echo 'test TEST_FILE=<test_file>   - run all tests in file'
 	@echo 'test_watch                   - run unit tests in watch mode'
+	@echo 'venv                         - create a virtual environment if it does not exist'
+	@echo 'setup                        - set up the virtual environment with all dependencies'
+	@echo 'dev                          - run development server with hot reload'
 

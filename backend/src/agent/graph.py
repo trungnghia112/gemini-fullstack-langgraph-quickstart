@@ -1,4 +1,7 @@
 import os
+import time
+import logging
+from typing import Dict, Any
 
 from agent.tools_and_schemas import SearchQueryList, Reflection
 from dotenv import load_dotenv
@@ -8,6 +11,7 @@ from langgraph.graph import StateGraph
 from langgraph.graph import START, END
 from langchain_core.runnables import RunnableConfig
 from google.genai import Client
+from google.api_core.exceptions import ResourceExhausted, GoogleAPIError
 
 from agent.state import (
     OverallState,
@@ -36,8 +40,59 @@ load_dotenv()
 if os.getenv("GEMINI_API_KEY") is None:
     raise ValueError("GEMINI_API_KEY is not set")
 
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 # Used for Google Search API
 genai_client = Client(api_key=os.getenv("GEMINI_API_KEY"))
+
+
+def handle_api_error(error: Exception, search_query: str) -> Dict[str, Any]:
+    """Handle API errors gracefully and return fallback response.
+
+    Args:
+        error: The exception that occurred
+        search_query: The search query that failed
+
+    Returns:
+        Dictionary with fallback response data
+    """
+    if isinstance(error, ResourceExhausted):
+        logger.warning(f"Google API quota exhausted for query: {search_query}")
+        fallback_message = (
+            f"⚠️ **API Quota Exhausted**\n\n"
+            f"The Google Search API quota has been exceeded while researching: '{search_query}'\n\n"
+            f"**What this means:**\n"
+            f"- The research system has reached its daily/hourly API usage limit\n"
+            f"- This is a temporary limitation that will reset automatically\n"
+            f"- The research will continue with available information from other queries\n\n"
+            f"**Recommendations:**\n"
+            f"- Try again later when the quota resets\n"
+            f"- Consider using fewer search queries or reducing research depth\n"
+            f"- Contact the administrator if this issue persists"
+        )
+    elif isinstance(error, GoogleAPIError):
+        logger.error(f"Google API error for query '{search_query}': {error}")
+        fallback_message = (
+            f"⚠️ **Search API Error**\n\n"
+            f"An error occurred while searching for: '{search_query}'\n\n"
+            f"Error details: {str(error)}\n\n"
+            f"The research will continue with available information from other queries."
+        )
+    else:
+        logger.error(f"Unexpected error during web research for query '{search_query}': {error}")
+        fallback_message = (
+            f"⚠️ **Research Error**\n\n"
+            f"An unexpected error occurred while researching: '{search_query}'\n\n"
+            f"The research will continue with available information from other queries."
+        )
+
+    return {
+        "sources_gathered": [],
+        "search_query": [search_query],
+        "web_research_result": [fallback_message],
+    }
 
 
 # Nodes
@@ -45,7 +100,7 @@ def generate_query(state: OverallState, config: RunnableConfig) -> QueryGenerati
     """LangGraph node that generates a search queries based on the User's question.
 
     Uses Gemini 2.0 Flash to create an optimized search query for web research based on
-    the User's question.
+    the User's question. Includes error handling for API failures.
 
     Args:
         state: Current graph state containing the User's question
@@ -55,30 +110,47 @@ def generate_query(state: OverallState, config: RunnableConfig) -> QueryGenerati
         Dictionary with state update, including search_query key containing the generated query
     """
     configurable = Configuration.from_runnable_config(config)
+    research_topic = get_research_topic(state["messages"])
+    logger.info(f"Generating search queries for topic: {research_topic[:100]}...")
 
     # check for custom initial search query count
     if state.get("initial_search_query_count") is None:
         state["initial_search_query_count"] = configurable.number_of_initial_queries
 
-    # init Gemini 2.0 Flash
-    llm = ChatGoogleGenerativeAI(
-        model=configurable.query_generator_model,
-        temperature=1.0,
-        max_retries=2,
-        api_key=os.getenv("GEMINI_API_KEY"),
-    )
-    structured_llm = llm.with_structured_output(SearchQueryList)
+    try:
+        # init Gemini 2.0 Flash
+        llm = ChatGoogleGenerativeAI(
+            model=configurable.query_generator_model,
+            temperature=1.0,
+            max_retries=2,
+            api_key=os.getenv("GEMINI_API_KEY"),
+        )
+        structured_llm = llm.with_structured_output(SearchQueryList)
 
-    # Format the prompt
-    current_date = get_current_date()
-    formatted_prompt = query_writer_instructions.format(
-        current_date=current_date,
-        research_topic=get_research_topic(state["messages"]),
-        number_queries=state["initial_search_query_count"],
-    )
-    # Generate the search queries
-    result = structured_llm.invoke(formatted_prompt)
-    return {"query_list": result.query}
+        # Format the prompt
+        current_date = get_current_date()
+        formatted_prompt = query_writer_instructions.format(
+            current_date=current_date,
+            research_topic=research_topic,
+            number_queries=state["initial_search_query_count"],
+        )
+        # Generate the search queries
+        result = structured_llm.invoke(formatted_prompt)
+        logger.info(f"Successfully generated {len(result.query)} search queries")
+        return {"query_list": result.query}
+
+    except (ResourceExhausted, GoogleAPIError) as e:
+        logger.error(f"Google API error during query generation: {e}")
+        # Fallback to basic queries derived from the research topic
+        fallback_queries = [research_topic[:100]]  # Use first 100 chars as basic query
+        logger.info(f"Using fallback query: {fallback_queries[0]}")
+        return {"query_list": fallback_queries}
+    except Exception as e:
+        logger.error(f"Unexpected error during query generation: {e}")
+        # Fallback to basic queries derived from the research topic
+        fallback_queries = [research_topic[:100]]  # Use first 100 chars as basic query
+        logger.info(f"Using fallback query: {fallback_queries[0]}")
+        return {"query_list": fallback_queries}
 
 
 def continue_to_web_research(state: QueryGenerationState):
@@ -96,6 +168,7 @@ def web_research(state: WebSearchState, config: RunnableConfig) -> OverallState:
     """LangGraph node that performs web research using the native Google Search API tool.
 
     Executes a web search using the native Google Search API tool in combination with Gemini 2.0 Flash.
+    Includes robust error handling for quota exhaustion and other API errors.
 
     Args:
         state: Current graph state containing the search query and research loop count
@@ -104,36 +177,64 @@ def web_research(state: WebSearchState, config: RunnableConfig) -> OverallState:
     Returns:
         Dictionary with state update, including sources_gathered, research_loop_count, and web_research_results
     """
+    search_query = state["search_query"]
+    logger.info(f"Starting web research for query: {search_query}")
+
     # Configure
     configurable = Configuration.from_runnable_config(config)
     formatted_prompt = web_searcher_instructions.format(
         current_date=get_current_date(),
-        research_topic=state["search_query"],
+        research_topic=search_query,
     )
 
-    # Uses the google genai client as the langchain client doesn't return grounding metadata
-    response = genai_client.models.generate_content(
-        model=configurable.query_generator_model,
-        contents=formatted_prompt,
-        config={
-            "tools": [{"google_search": {}}],
-            "temperature": 0,
-        },
-    )
-    # resolve the urls to short urls for saving tokens and time
-    resolved_urls = resolve_urls(
-        response.candidates[0].grounding_metadata.grounding_chunks, state["id"]
-    )
-    # Gets the citations and adds them to the generated text
-    citations = get_citations(response, resolved_urls)
-    modified_text = insert_citation_markers(response.text, citations)
-    sources_gathered = [item for citation in citations for item in citation["segments"]]
+    try:
+        # Uses the google genai client as the langchain client doesn't return grounding metadata
+        response = genai_client.models.generate_content(
+            model=configurable.query_generator_model,
+            contents=formatted_prompt,
+            config={
+                "tools": [{"google_search": {}}],
+                "temperature": 0,
+            },
+        )
 
-    return {
-        "sources_gathered": sources_gathered,
-        "search_query": [state["search_query"]],
-        "web_research_result": [modified_text],
-    }
+        # Check if response has the expected structure
+        if not response or not response.candidates:
+            logger.warning(f"Empty response received for query: {search_query}")
+            return handle_api_error(Exception("Empty response from API"), search_query)
+
+        candidate = response.candidates[0]
+        if not hasattr(candidate, 'grounding_metadata') or not candidate.grounding_metadata:
+            logger.warning(f"No grounding metadata in response for query: {search_query}")
+            # Return the text without citations if no grounding metadata
+            return {
+                "sources_gathered": [],
+                "search_query": [search_query],
+                "web_research_result": [response.text or "No search results available."],
+            }
+
+        # resolve the urls to short urls for saving tokens and time
+        resolved_urls = resolve_urls(
+            candidate.grounding_metadata.grounding_chunks, state["id"]
+        )
+        # Gets the citations and adds them to the generated text
+        citations = get_citations(response, resolved_urls)
+        modified_text = insert_citation_markers(response.text, citations)
+        sources_gathered = [item for citation in citations for item in citation["segments"]]
+
+        logger.info(f"Successfully completed web research for query: {search_query}")
+        return {
+            "sources_gathered": sources_gathered,
+            "search_query": [search_query],
+            "web_research_result": [modified_text],
+        }
+
+    except (ResourceExhausted, GoogleAPIError) as e:
+        logger.error(f"Google API error during web research: {e}")
+        return handle_api_error(e, search_query)
+    except Exception as e:
+        logger.error(f"Unexpected error during web research: {e}")
+        return handle_api_error(e, search_query)
 
 
 def reflection(state: OverallState, config: RunnableConfig) -> ReflectionState:
@@ -141,7 +242,7 @@ def reflection(state: OverallState, config: RunnableConfig) -> ReflectionState:
 
     Analyzes the current summary to identify areas for further research and generates
     potential follow-up queries. Uses structured output to extract
-    the follow-up query in JSON format.
+    the follow-up query in JSON format. Includes error handling for API failures.
 
     Args:
         state: Current graph state containing the running summary and research topic
@@ -155,29 +256,54 @@ def reflection(state: OverallState, config: RunnableConfig) -> ReflectionState:
     state["research_loop_count"] = state.get("research_loop_count", 0) + 1
     reasoning_model = state.get("reasoning_model") or configurable.reasoning_model
 
-    # Format the prompt
-    current_date = get_current_date()
-    formatted_prompt = reflection_instructions.format(
-        current_date=current_date,
-        research_topic=get_research_topic(state["messages"]),
-        summaries="\n\n---\n\n".join(state["web_research_result"]),
-    )
-    # init Reasoning Model
-    llm = ChatGoogleGenerativeAI(
-        model=reasoning_model,
-        temperature=1.0,
-        max_retries=2,
-        api_key=os.getenv("GEMINI_API_KEY"),
-    )
-    result = llm.with_structured_output(Reflection).invoke(formatted_prompt)
+    logger.info(f"Starting reflection phase (loop {state['research_loop_count']})")
 
-    return {
-        "is_sufficient": result.is_sufficient,
-        "knowledge_gap": result.knowledge_gap,
-        "follow_up_queries": result.follow_up_queries,
-        "research_loop_count": state["research_loop_count"],
-        "number_of_ran_queries": len(state["search_query"]),
-    }
+    try:
+        # Format the prompt
+        current_date = get_current_date()
+        formatted_prompt = reflection_instructions.format(
+            current_date=current_date,
+            research_topic=get_research_topic(state["messages"]),
+            summaries="\n\n---\n\n".join(state["web_research_result"]),
+        )
+        # init Reasoning Model
+        llm = ChatGoogleGenerativeAI(
+            model=reasoning_model,
+            temperature=1.0,
+            max_retries=2,
+            api_key=os.getenv("GEMINI_API_KEY"),
+        )
+        result = llm.with_structured_output(Reflection).invoke(formatted_prompt)
+
+        logger.info(f"Reflection completed - sufficient: {result.is_sufficient}")
+        return {
+            "is_sufficient": result.is_sufficient,
+            "knowledge_gap": result.knowledge_gap,
+            "follow_up_queries": result.follow_up_queries,
+            "research_loop_count": state["research_loop_count"],
+            "number_of_ran_queries": len(state["search_query"]),
+        }
+
+    except (ResourceExhausted, GoogleAPIError) as e:
+        logger.error(f"Google API error during reflection: {e}")
+        # Fallback: assume research is sufficient to avoid infinite loops
+        return {
+            "is_sufficient": True,
+            "knowledge_gap": f"Unable to perform reflection due to API error: {str(e)}",
+            "follow_up_queries": [],
+            "research_loop_count": state["research_loop_count"],
+            "number_of_ran_queries": len(state["search_query"]),
+        }
+    except Exception as e:
+        logger.error(f"Unexpected error during reflection: {e}")
+        # Fallback: assume research is sufficient to avoid infinite loops
+        return {
+            "is_sufficient": True,
+            "knowledge_gap": f"Unable to perform reflection due to unexpected error: {str(e)}",
+            "follow_up_queries": [],
+            "research_loop_count": state["research_loop_count"],
+            "number_of_ran_queries": len(state["search_query"]),
+        }
 
 
 def evaluate_research(
@@ -222,7 +348,7 @@ def finalize_answer(state: OverallState, config: RunnableConfig):
 
     Prepares the final output by deduplicating and formatting sources, then
     combining them with the running summary to create a well-structured
-    research report with proper citations.
+    research report with proper citations. Includes error handling for API failures.
 
     Args:
         state: Current graph state containing the running summary and sources gathered
@@ -233,36 +359,69 @@ def finalize_answer(state: OverallState, config: RunnableConfig):
     configurable = Configuration.from_runnable_config(config)
     reasoning_model = state.get("reasoning_model") or configurable.reasoning_model
 
-    # Format the prompt
-    current_date = get_current_date()
-    formatted_prompt = answer_instructions.format(
-        current_date=current_date,
-        research_topic=get_research_topic(state["messages"]),
-        summaries="\n---\n\n".join(state["web_research_result"]),
-    )
+    logger.info("Finalizing research answer")
 
-    # init Reasoning Model, default to Gemini 2.5 Flash
-    llm = ChatGoogleGenerativeAI(
-        model=reasoning_model,
-        temperature=0,
-        max_retries=2,
-        api_key=os.getenv("GEMINI_API_KEY"),
-    )
-    result = llm.invoke(formatted_prompt)
+    try:
+        # Format the prompt
+        current_date = get_current_date()
+        formatted_prompt = answer_instructions.format(
+            current_date=current_date,
+            research_topic=get_research_topic(state["messages"]),
+            summaries="\n---\n\n".join(state["web_research_result"]),
+        )
 
-    # Replace the short urls with the original urls and add all used urls to the sources_gathered
-    unique_sources = []
-    for source in state["sources_gathered"]:
-        if source["short_url"] in result.content:
-            result.content = result.content.replace(
-                source["short_url"], source["value"]
-            )
-            unique_sources.append(source)
+        # init Reasoning Model, default to Gemini 2.5 Flash
+        llm = ChatGoogleGenerativeAI(
+            model=reasoning_model,
+            temperature=0,
+            max_retries=2,
+            api_key=os.getenv("GEMINI_API_KEY"),
+        )
+        result = llm.invoke(formatted_prompt)
 
-    return {
-        "messages": [AIMessage(content=result.content)],
-        "sources_gathered": unique_sources,
-    }
+        # Replace the short urls with the original urls and add all used urls to the sources_gathered
+        unique_sources = []
+        for source in state["sources_gathered"]:
+            if source["short_url"] in result.content:
+                result.content = result.content.replace(
+                    source["short_url"], source["value"]
+                )
+                unique_sources.append(source)
+
+        logger.info("Successfully finalized research answer")
+        return {
+            "messages": [AIMessage(content=result.content)],
+            "sources_gathered": unique_sources,
+        }
+
+    except (ResourceExhausted, GoogleAPIError) as e:
+        logger.error(f"Google API error during answer finalization: {e}")
+        # Fallback: create a basic summary from available research results
+        fallback_content = "# Research Summary\n\n"
+        fallback_content += "⚠️ **Note**: Unable to generate final summary due to API quota exhaustion.\n\n"
+        fallback_content += "## Available Research Results:\n\n"
+
+        for i, result in enumerate(state["web_research_result"], 1):
+            fallback_content += f"### Research Result {i}\n{result}\n\n"
+
+        return {
+            "messages": [AIMessage(content=fallback_content)],
+            "sources_gathered": state.get("sources_gathered", []),
+        }
+    except Exception as e:
+        logger.error(f"Unexpected error during answer finalization: {e}")
+        # Fallback: create a basic summary from available research results
+        fallback_content = "# Research Summary\n\n"
+        fallback_content += f"⚠️ **Note**: Unable to generate final summary due to an error: {str(e)}\n\n"
+        fallback_content += "## Available Research Results:\n\n"
+
+        for i, result in enumerate(state["web_research_result"], 1):
+            fallback_content += f"### Research Result {i}\n{result}\n\n"
+
+        return {
+            "messages": [AIMessage(content=fallback_content)],
+            "sources_gathered": state.get("sources_gathered", []),
+        }
 
 
 # Create our Agent Graph
